@@ -10,6 +10,11 @@
 #include "emu.h"
 #include "neogeo.h"
 #include "video/resnet.h"
+#include "retrodepth.h"
+#include <thread>
+#include <chrono>
+#include <unordered_map>
+#include <vector>
 
 #define VERBOSE     (0)
 
@@ -162,6 +167,108 @@ uint32_t neogeo_base_state::screen_update(screen_device &screen, bitmap_rgb32 &b
 	m_sprgen->draw_sprites(bitmap, cliprect.min_y);
 
 	m_sprgen->draw_fixed_layer(bitmap, cliprect.min_y);
+
+	// --- RetroDepth layer export ---
+	// 4 sprite groups routed by palette index; Unity sets this via
+	// retrodepth_set_palette_route(). route[pal] = 0-3 selects grp0-grp3;
+	// 0xFF (the default) routes to grp0.
+	if (retrodepth_active())
+	{
+		static constexpr int N_GROUPS = 4;
+
+		// Read palette→group routing table from retrodepth
+		RDPaletteRoute ctrl;
+		retrodepth_read_palette_route(&ctrl);
+
+		const rectangle& vis = screen.visible_area();
+
+		static bitmap_rgb32 s_bg, s_grp[N_GROUPS], s_fix;
+		const int bw = bitmap.width(), bh = bitmap.height();
+		if (s_bg.width() != bw || s_bg.height() != bh) {
+			s_bg.allocate(bw, bh);
+			for (int g = 0; g < N_GROUPS; ++g) s_grp[g].allocate(bw, bh);
+			s_fix.allocate(bw, bh);
+		}
+
+		s_bg.fill(*m_bg_pen, cliprect);
+		for (int g = 0; g < N_GROUPS; ++g) {
+			s_grp[g].fill(1, cliprect); // sentinel: unfilled pixel != real black
+			m_sprgen->draw_sprites(s_grp[g], cliprect.min_y,
+			                       0, 95, 0, 255, ctrl.route, (uint8_t)g);
+		}
+		s_fix.fill(1, cliprect);
+		m_sprgen->draw_fixed_layer(s_fix, cliprect.min_y);
+
+		// At end of frame: write palette data + layers to shared memory.
+		if (cliprect.max_y >= vis.max_y)
+		{
+			// Ship palette colours so retrodepth can show swatches.
+			const pen_t* pens = m_palette->pens() + m_palette_bank;
+			retrodepth_write_palette_data(reinterpret_cast<const uint32_t*>(pens), 256 * 16);
+
+			const int w = vis.width(), h = vis.height();
+			std::vector<uint32_t> packed(w * h);
+			std::vector<uint16_t> owners(w * h, RD_OWNER_NONE);
+			std::unordered_map<uint32_t, uint16_t> owner_maps[N_GROUPS];
+			std::unordered_map<uint32_t, uint16_t> fix_owner_map;
+			// Built every frame - this is what marks each layer's unfilled
+			// pixels as transparent for AR compositing, not just an
+			// editor/thumbnail nicety, so it must not be gated behind
+			// ctrl.thumb_requested (which only reflects whether RetroDepth's
+			// own palette editor is open; a Unity/mobile client never sets it,
+			// so every layer would otherwise export fully opaque and blot out
+			// everything stacked behind it).
+			for (int p = 0; p < 256; ++p)
+			{
+				uint8_t g = ctrl.route[p];
+				if (g == 0xFF) g = 0;
+				for (int c = 0; c < 16; ++c) {
+					uint32_t col = reinterpret_cast<const uint32_t*>(pens)[p * 16 + c];
+					if (!owner_maps[g].count(col))
+						owner_maps[g][col] = (uint16_t)p;
+					if (!fix_owner_map.count(col))
+						fix_owner_map[col] = (uint16_t)p;
+				}
+			}
+
+			auto write_layer = [&](uint32_t z_order, const char* name, bitmap_rgb32& bmp,
+			                       const std::unordered_map<uint32_t, uint16_t>* owner_map) {
+				for (int row = 0; row < h; ++row)
+					memcpy(&packed[row * w],
+					       &bmp.pix(vis.min_y + row, vis.min_x),
+					       w * sizeof(uint32_t));
+				if (owner_map) {
+					for (int i = 0; i < w * h; ++i) {
+						auto it = owner_map->find(packed[i]);
+						owners[i] = (it != owner_map->end()) ? it->second : RD_OWNER_NONE;
+					}
+					retrodepth_write_layer(z_order, name, packed.data(), owners.data(), w, h);
+				} else {
+					retrodepth_write_layer(z_order, name, packed.data(), nullptr, w, h);
+				}
+			};
+
+			static const char* k_grp_names[N_GROUPS] = { "grp0", "grp1", "grp2", "grp3" };
+			write_layer(0, "background", s_bg, nullptr);
+			for (int g = 0; g < N_GROUPS; ++g)
+				write_layer(g + 1, k_grp_names[g], s_grp[g], &owner_maps[g]);
+			write_layer(N_GROUPS + 1, "fix", s_fix, &fix_owner_map);
+
+			// Per-palette thumbnail rendering (a desktop RetroDepth palette-
+			// editor UI feature) is intentionally not ported to mobile - the
+			// mobile transport (retrodepth.h) has no thumb_requested/
+			// pal_thumb equivalent. Depth tuning on mobile happens through
+			// Unity-side tooling instead, same as the desktop fork's own
+			// workflow, which never used RetroDepth's own editor UI either.
+
+			retrodepth_commit();
+			// Debug slow-motion: sleep after each frame commit so each frame stays
+			// visible long enough to inspect. Set SLOWMO_MS to 0 to disable.
+			static constexpr int SLOWMO_MS = 0;
+			if constexpr (SLOWMO_MS > 0)
+				std::this_thread::sleep_for(std::chrono::milliseconds(SLOWMO_MS));
+		}
+	}
 
 	return 0;
 }

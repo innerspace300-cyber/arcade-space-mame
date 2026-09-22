@@ -624,6 +624,7 @@ Stephh's inputs notes (based on some tests on the "parent" set) :
 #include "cps1.h"
 #include "cps2comm.h"
 #include "cps2crypt.h"
+#include "../../emu/retrodepth.h"
 
 #include "cpu/z80/z80.h"
 #include "machine/eepromser.h"
@@ -1006,6 +1007,10 @@ void cps2_state::render_layers(screen_device &screen, bitmap_ind16 &bitmap, cons
 	uint8_t l1 = (layercontrol >> 0x08) & 0x03;
 	uint8_t l2 = (layercontrol >> 0x0a) & 0x03;
 	uint8_t l3 = (layercontrol >> 0x0c) & 0x03;
+	// Preserve the original draw sequence (0=sprites, 1-3=scroll1-3) for the
+	// RetroDepth export below, before the "take out sprites layer" step
+	// mutates l0-l3 for cps2_render_sprites()'s own priority-masked draw.
+	const int retrodepth_draw_seq[4] = { l0, l1, l2, l3 };
 	screen.priority().fill(0, cliprect);
 
 	uint32_t primasks[8]{};
@@ -1060,6 +1065,91 @@ void cps2_state::render_layers(screen_device &screen, bitmap_ind16 &bitmap, cons
 	cps1_render_layer(screen, bitmap, cliprect, l1, 2);
 	cps1_render_layer(screen, bitmap, cliprect, l2, 4);
 	cps2_render_sprites(screen, bitmap, cliprect, primasks);
+
+	// --- RetroDepth layer export ---
+	if (retrodepth_active())
+	{
+		const rectangle& vis = screen.visible_area();
+		const int bw = bitmap.width(), bh = bitmap.height();
+
+		static bitmap_ind16 s_bg, s_scroll[3], s_sprites;
+		if (s_bg.width() != bw || s_bg.height() != bh) {
+			s_bg.allocate(bw, bh);
+			for (int i = 0; i < 3; ++i) s_scroll[i].allocate(bw, bh);
+			s_sprites.allocate(bw, bh);
+		}
+
+		s_bg.fill(0xbff, cliprect);
+
+		for (int i = 0; i < 3; ++i) {
+			s_scroll[i].fill(0xbff, cliprect);
+			screen.priority().fill(0, cliprect);
+			m_bg_tilemap[i]->draw(screen, s_scroll[i], cliprect, TILEMAP_DRAW_LAYER1, 0);
+		}
+
+		s_sprites.fill(0xbff, cliprect);
+		screen.priority().fill(0, cliprect);
+		// In gfx_element::prio_transpen, a SET bit in pmask BLOCKS drawing at
+		// that destination-priority value (see PIXEL_OP_REBASE_TRANSPEN_PRIORITY
+		// in drawgfxt.ipp: draws only when ((1<<priority) & pmask) == 0). All
+		// zeros - not all ones - means "no priority level is blocked", i.e.
+		// every sprite draws regardless of the (zeroed) priority buffer. 0xff
+		// was backwards and silently discarded every sprite pixel.
+		uint32_t all_primasks[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
+		cps2_render_sprites(screen, s_sprites, cliprect, all_primasks);
+
+		if (cliprect.max_y >= vis.max_y)
+		{
+			const rgb_t* colors = m_palette->palette()->entry_list_adjusted();
+			const int n_pens = (int)m_palette->palette()->num_colors();
+
+			static uint32_t pal_data[256 * 16];
+			memset(pal_data, 0, sizeof(pal_data));
+			int copy_count = (n_pens < 256 * 16) ? n_pens : (256 * 16);
+			for (int i = 0; i < copy_count; ++i)
+				pal_data[i] = (uint32_t)colors[i];
+			retrodepth_write_palette_data(pal_data, 256 * 16);
+
+			const int w = vis.width(), h = vis.height();
+			std::vector<uint32_t> packed(w * h);
+			std::vector<uint16_t> owners(w * h);
+
+			auto write_layer = [&](uint32_t z_order, const char* name,
+			                       bitmap_ind16& bmp, bool has_owners) {
+				for (int row = 0; row < h; ++row) {
+					for (int col = 0; col < w; ++col) {
+						uint16_t pen = bmp.pix(vis.min_y + row, vis.min_x + col);
+						int idx = row * w + col;
+						if (has_owners && pen == 0xbff)
+							packed[idx] = 0x00000001u;
+						else
+							packed[idx] = (pen < (uint16_t)n_pens) ? (uint32_t)colors[pen] : 0u;
+						if (has_owners)
+							owners[idx] = (pen != 0xbff) ? (uint16_t)(pen / 16) : RD_OWNER_NONE;
+					}
+				}
+				retrodepth_write_layer(z_order, name, packed.data(),
+				                       has_owners ? owners.data() : nullptr, w, h);
+			};
+
+			// CPS2 reorders layers per scene just like CPS1 (same layer-control
+			// register); export the ACTUAL draw order (retrodepth_draw_seq,
+			// captured above before it gets mutated for sprite priority
+			// masking). Layer ids: 0 = sprites, 1-3 = scroll1-3.
+			uint32_t z_of[4] = { 4, 3, 2, 1 };  // fallback if a layer id is absent
+			for (int i = 0; i < 4; ++i)
+				z_of[retrodepth_draw_seq[i]] = (uint32_t)i + 1;
+
+			write_layer(0,       "background", s_bg,        false);
+			write_layer(z_of[3], "scroll3",    s_scroll[2], true);
+			write_layer(z_of[2], "scroll2",    s_scroll[1], true);
+			write_layer(z_of[1], "scroll1",    s_scroll[0], true);
+			write_layer(z_of[0], "sprites",    s_sprites,   true);
+
+			retrodepth_commit();
+			m_retrodepth_layer_exported = true;
+		}
+	}
 }
 
 

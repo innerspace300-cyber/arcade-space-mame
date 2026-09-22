@@ -35,6 +35,7 @@
 #include "unzip.h"
 
 #include "osdepend.h"
+#include "retrodepth.h"
 
 #include <rapidjson/writer.h>
 #include <rapidjson/stringbuffer.h>
@@ -147,6 +148,9 @@ std::string running_machine::describe_context() const
 
 void running_machine::start()
 {
+	// RetroDepth: init the in-process layer-export buffer for the Unity bridge
+	retrodepth_init();
+
 	// initialize basic can't-fail systems here
 	m_configuration = std::make_unique<configuration_manager>(*this);
 	m_ui_input = std::make_unique<ui_input_manager_impl>(*this);

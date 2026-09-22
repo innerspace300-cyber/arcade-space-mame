@@ -462,6 +462,8 @@ The games seem to use them to mark platforms, kill zones and no-go areas.
 
 #include "emu.h"
 #include "cps1.h"
+#include "../../emu/retrodepth.h"
+#include <vector>
 
 #define VERBOSE 0
 
@@ -3046,7 +3048,105 @@ uint32_t cps_state::screen_update_cps1(screen_device &screen, bitmap_ind16 &bitm
 		cps1_render_stars(screen, bitmap, cliprect);
 	}
 
+	m_retrodepth_layer_exported = false;
 	render_layers(screen, bitmap, cliprect);
+
+	// --- RetroDepth layer export ---
+	// Exports each CPS1 hardware layer as a separate depth plane.
+	// Layers: background (solid), scroll3, scroll2, scroll1, sprites.
+	// Skipped when render_layers() is a subclass override (e.g. cps2_state)
+	// that already did its own export with the correct sprite renderer for
+	// that hardware — this block's cps1_render_sprites() call would
+	// otherwise misread CPS2 sprite RAM and clobber a good export with
+	// garbage, since both blocks write the same shared-memory slots.
+	if (retrodepth_active() && !m_retrodepth_layer_exported)
+	{
+		const rectangle& vis = screen.visible_area();
+		const int bw = bitmap.width(), bh = bitmap.height();
+
+		// Static per-layer bitmaps (allocated once, reused each frame)
+		static bitmap_ind16 s_bg, s_scroll[3], s_sprites;
+		if (s_bg.width() != bw || s_bg.height() != bh) {
+			s_bg.allocate(bw, bh);
+			for (int i = 0; i < 3; ++i) s_scroll[i].allocate(bw, bh);
+			s_sprites.allocate(bw, bh);
+		}
+
+		// Background: solid fill with the hardware background pen
+		s_bg.fill(0xbff, cliprect);
+
+		// Scroll tilemaps (bg_tilemap[0]=scroll1, [1]=scroll2, [2]=scroll3)
+		for (int i = 0; i < 3; ++i) {
+			s_scroll[i].fill(0xbff, cliprect);
+			screen.priority().fill(0, cliprect);
+			m_bg_tilemap[i]->draw(screen, s_scroll[i], cliprect, TILEMAP_DRAW_LAYER1, 0);
+		}
+
+		// Sprites
+		s_sprites.fill(0xbff, cliprect);
+		screen.priority().fill(0, cliprect);
+		cps1_render_sprites(screen, s_sprites, cliprect);
+
+		// Export at end of visible area (cliprect covers last scanline strip)
+		if (cliprect.max_y >= vis.max_y)
+		{
+			// Use the adjusted color array (same source MAME's display uses).
+			// m_palette->pens() returns remapped pen *indices*, not RGB values.
+			const rgb_t* colors = m_palette->palette()->entry_list_adjusted();
+			const int n_pens = (int)m_palette->palette()->num_colors();
+
+			// Write palette data into the shared-memory header (256 palette slots;
+			// CPS1 uses palettes 0-191, remaining slots are zeroed).
+			static uint32_t pal_data[256 * 16];
+			memset(pal_data, 0, sizeof(pal_data));
+			int copy_count = (n_pens < 256 * 16) ? n_pens : (256 * 16);
+			for (int i = 0; i < copy_count; ++i)
+				pal_data[i] = (uint32_t)colors[i];
+			retrodepth_write_palette_data(pal_data, 256 * 16);
+
+			const int w = vis.width(), h = vis.height();
+			std::vector<uint32_t> packed(w * h);
+			std::vector<uint16_t> owners(w * h);
+
+			// Convert a bitmap_ind16 layer to BGRA + owner_ids and ship to shmem.
+			// owner_id = pen_index / 16 (palette number); background pen gets NONE.
+			auto write_layer = [&](uint32_t z_order, const char* name,
+			                       bitmap_ind16& bmp, bool has_owners) {
+				for (int row = 0; row < h; ++row) {
+					for (int col = 0; col < w; ++col) {
+						uint16_t pen = bmp.pix(vis.min_y + row, vis.min_x + col);
+						int idx = row * w + col;
+						if (has_owners && pen == 0xbff)
+							packed[idx] = 0x00000001u; // transparent sentinel
+						else
+							packed[idx] = (pen < (uint16_t)n_pens) ? (uint32_t)colors[pen] : 0u;
+						if (has_owners)
+							owners[idx] = (pen != 0xbff) ? (uint16_t)(pen / 16) : RD_OWNER_NONE;
+					}
+				}
+				retrodepth_write_layer(z_order, name, packed.data(),
+				                       has_owners ? owners.data() : nullptr, w, h);
+			};
+
+			// CPS1 reorders layers per scene via the layer-control register, so
+			// export the ACTUAL draw order (l0 drawn first = furthest back).
+			// Layer ids: 0 = sprites, 1-3 = scroll1-3.
+			int lc = m_cps_b_regs[m_game_config->layer_control / 2];
+			int draw_seq[4] = { (lc >> 0x06) & 3, (lc >> 0x08) & 3,
+			                    (lc >> 0x0a) & 3, (lc >> 0x0c) & 3 };
+			uint32_t z_of[4] = { 4, 3, 2, 1 };  // fallback if a layer is absent
+			for (int i = 0; i < 4; ++i)
+				z_of[draw_seq[i]] = (uint32_t)i + 1;
+
+			write_layer(0,       "background", s_bg,        false);
+			write_layer(z_of[3], "scroll3",    s_scroll[2], true);
+			write_layer(z_of[2], "scroll2",    s_scroll[1], true);
+			write_layer(z_of[1], "scroll1",    s_scroll[0], true);
+			write_layer(z_of[0], "sprites",    s_sprites,   true);
+
+			retrodepth_commit();
+		}
+	}
 
 	return 0;
 }

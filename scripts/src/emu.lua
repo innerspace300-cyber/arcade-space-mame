@@ -170,6 +170,8 @@ files {
 	MAME_DIR .. "src/emu/logmacro.h",
 	MAME_DIR .. "src/emu/machine.cpp",
 	MAME_DIR .. "src/emu/machine.h",
+	MAME_DIR .. "src/emu/retrodepth.cpp",
+	MAME_DIR .. "src/emu/retrodepth.h",
 	MAME_DIR .. "src/emu/mconfig.cpp",
 	MAME_DIR .. "src/emu/mconfig.h",
 	MAME_DIR .. "src/emu/memarray.cpp",

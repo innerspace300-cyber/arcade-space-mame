@@ -280,7 +280,40 @@ inline bool neosprite_base_device::sprite_on_scanline(int scanline, int y, int r
 }
 
 
-void neosprite_base_device::draw_sprites(bitmap_rgb32 &bitmap, int scanline)
+int neosprite_base_device::active_slot_count(int scanline) const
+{
+	const u16 *sprite_list = BIT(scanline, 0)
+		? &m_videoram_drawsource[0x8680]
+		: &m_videoram_drawsource[0x8600];
+	int idx = MAX_SPRITES_PER_LINE - 1;
+	while (idx > 0 && sprite_list[idx] == 0) --idx;
+	return idx + 1; // +1 so caller can use as exclusive upper bound
+}
+
+int neosprite_base_device::chain_groups(int scanline, int out_starts[], int max_groups) const
+{
+	if (!m_videoram_drawsource) return 0;
+
+	const u16 *sprite_list = BIT(scanline, 0)
+		? &m_videoram_drawsource[0x8680]
+		: &m_videoram_drawsource[0x8600];
+
+	// Find last active slot
+	int max_slot = MAX_SPRITES_PER_LINE - 1;
+	while (max_slot > 0 && sprite_list[max_slot] == 0) --max_slot;
+
+	int n = 0;
+	for (int s = 0; s <= max_slot && n < max_groups; ++s)
+	{
+		const u16 sprite_number = sprite_list[s] & 0x01ff;
+		const u16 y_control = m_videoram_drawsource[0x8200 | sprite_number];
+		if (!BIT(y_control, 6)) // bit 6 clear = NOT chained = chain head
+			out_starts[n++] = s;
+	}
+	return n;
+}
+
+void neosprite_base_device::draw_sprites(bitmap_rgb32 &bitmap, int scanline, int slot_min, int slot_max, int pal_min, int pal_max, const uint8_t* route_table, uint8_t target_group)
 {
 	int max_sprite_index;
 	int y = 0;
@@ -309,7 +342,10 @@ void neosprite_base_device::draw_sprites(bitmap_rgb32 &bitmap, int scanline)
 	if (max_sprite_index != (MAX_SPRITES_PER_LINE - 1))
 		max_sprite_index = max_sprite_index + 1;
 
-	for (int sprite_index = 0; sprite_index <= max_sprite_index; sprite_index++)
+	const int loop_max = std::min(max_sprite_index, slot_max);
+	// Always start from 0 so chained sprites (which inherit y/rows/zoom from an
+	// earlier slot) see the correct context even when slot_min > 0.
+	for (int sprite_index = 0; sprite_index <= loop_max; sprite_index++)
 	{
 		const u16 sprite_number = sprite_list[sprite_index] & 0x01ff;
 		const u16 y_control = m_videoram_drawsource[0x8200 | sprite_number];
@@ -332,6 +368,10 @@ void neosprite_base_device::draw_sprites(bitmap_rgb32 &bitmap, int scanline)
 			zoom_x = (zoom_control >> 8) & 0x0f;
 			rows = y_control & 0x3f;
 		}
+
+		// Context is now correct for this slot; skip rendering if below the requested range.
+		if (sprite_index < slot_min)
+			continue;
 
 		/* skip if falls completely outside the screen */
 		if ((x >= 0x140) && (x <= 0x1f0))
@@ -405,54 +445,67 @@ void neosprite_base_device::draw_sprites(bitmap_rgb32 &bitmap, int scanline)
 			else
 				x_inc = 1;
 
-			/* draw the line - no wrap-around */
-			if (x <= 0x01f0)
-			{
-				u32 *pixel_addr = &bitmap.pix(scanline, x + NEOGEO_HBEND);
-
-				for (int i = 0; i < 0x10; i++)
-				{
-					if (BIT(zoom_x_table, 15))
-					{
-						draw_pixel(gfx_base, pixel_addr, line_pens);
-
-						pixel_addr++;
-					}
-
-					zoom_x_table <<= 1;
-					if (zoom_x_table == 0)
-						break;
-
-					gfx_base += x_inc;
-				}
+			/* palette filter for RetroDepth layer splitting */
+			const int tile_pal = (attr >> 8) & 0xff;
+			bool pal_pass;
+			if (route_table) {
+				uint8_t g = route_table[tile_pal];
+				if (g == 0xFF) g = 0; // unassigned → grp0
+				pal_pass = (g == target_group);
+			} else {
+				pal_pass = (tile_pal >= pal_min && tile_pal <= pal_max);
 			}
-			/* wrap-around */
-			else
+			if (pal_pass)
 			{
-				const int x_save = x;
-				u32 *pixel_addr = &bitmap.pix(scanline, NEOGEO_HBEND);
-
-				for (int i = 0; i < 0x10; i++)
+				/* draw the line - no wrap-around */
+				if (x <= 0x01f0)
 				{
-					if (BIT(zoom_x_table, 15))
+					u32 *pixel_addr = &bitmap.pix(scanline, x + NEOGEO_HBEND);
+
+					for (int i = 0; i < 0x10; i++)
 					{
-						if (x >= 0x200)
+						if (BIT(zoom_x_table, 15))
 						{
 							draw_pixel(gfx_base, pixel_addr, line_pens);
 
 							pixel_addr++;
 						}
 
-						x++;
+						zoom_x_table <<= 1;
+						if (zoom_x_table == 0)
+							break;
+
+						gfx_base += x_inc;
 					}
-
-					zoom_x_table <<= 1;
-					if (zoom_x_table == 0)
-						break;
-
-					gfx_base += x_inc;
 				}
-				x = x_save;
+				/* wrap-around */
+				else
+				{
+					const int x_save = x;
+					u32 *pixel_addr = &bitmap.pix(scanline, NEOGEO_HBEND);
+
+					for (int i = 0; i < 0x10; i++)
+					{
+						if (BIT(zoom_x_table, 15))
+						{
+							if (x >= 0x200)
+							{
+								draw_pixel(gfx_base, pixel_addr, line_pens);
+
+								pixel_addr++;
+							}
+
+							x++;
+						}
+
+						zoom_x_table <<= 1;
+						if (zoom_x_table == 0)
+							break;
+
+						gfx_base += x_inc;
+					}
+					x = x_save;
+				}
 			}
 		}
 	}

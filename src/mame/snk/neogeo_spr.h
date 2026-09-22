@@ -31,7 +31,11 @@ public:
 	virtual void set_optimized_sprite_data(u8* sprdata, u32 mask);
 
 	void draw_fixed_layer(bitmap_rgb32 &bitmap, int scanline);
-	void draw_sprites(bitmap_rgb32 &bitmap, int scanline);
+	void draw_sprites(bitmap_rgb32 &bitmap, int scanline, int slot_min = 0, int slot_max = 95, int pal_min = 0, int pal_max = 255, const uint8_t* route_table = nullptr, uint8_t target_group = 0);
+	int  active_slot_count(int scanline) const; // returns highest occupied slot index + 1
+	// Fills out_starts[] with the sprite-list slot index of each chain-group head.
+	// Returns the number of groups found (at most max_groups).
+	int  chain_groups(int scanline, int out_starts[], int max_groups) const;
 
 	void set_videoram_offset(u16 data);
 	u16 get_videoram_data();

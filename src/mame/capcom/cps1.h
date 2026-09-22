@@ -254,6 +254,11 @@ protected:
 
 	virtual void render_layers(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
 	uint32_t screen_update_cps1(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
+	// Set by a render_layers() override (e.g. cps2_state) that performs its own
+	// RetroDepth layer export using the correct sprite renderer for that
+	// hardware, so screen_update_cps1()'s own CPS1-only export is skipped
+	// instead of double-exporting with garbage sprite data over it.
+	bool m_retrodepth_layer_exported = false;
 	void screen_vblank_cps1(int state);
 	void cps1_objram_latch(int state);
 
