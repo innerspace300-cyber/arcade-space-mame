@@ -1007,10 +1007,6 @@ void cps2_state::render_layers(screen_device &screen, bitmap_ind16 &bitmap, cons
 	uint8_t l1 = (layercontrol >> 0x08) & 0x03;
 	uint8_t l2 = (layercontrol >> 0x0a) & 0x03;
 	uint8_t l3 = (layercontrol >> 0x0c) & 0x03;
-	// Preserve the original draw sequence (0=sprites, 1-3=scroll1-3) for the
-	// RetroDepth export below, before the "take out sprites layer" step
-	// mutates l0-l3 for cps2_render_sprites()'s own priority-masked draw.
-	const int retrodepth_draw_seq[4] = { l0, l1, l2, l3 };
 	screen.priority().fill(0, cliprect);
 
 	uint32_t primasks[8]{};
@@ -1072,11 +1068,12 @@ void cps2_state::render_layers(screen_device &screen, bitmap_ind16 &bitmap, cons
 		const rectangle& vis = screen.visible_area();
 		const int bw = bitmap.width(), bh = bitmap.height();
 
-		static bitmap_ind16 s_bg, s_scroll[3], s_sprites;
+		static bitmap_ind16 s_bg, s_scroll[3], s_sprite_slot[4];
+		static bool s_slot_used[4];  // accumulated over this frame's partial updates
 		if (s_bg.width() != bw || s_bg.height() != bh) {
 			s_bg.allocate(bw, bh);
 			for (int i = 0; i < 3; ++i) s_scroll[i].allocate(bw, bh);
-			s_sprites.allocate(bw, bh);
+			for (int s = 0; s < 4; ++s) s_sprite_slot[s].allocate(bw, bh);
 		}
 
 		s_bg.fill(0xbff, cliprect);
@@ -1087,16 +1084,46 @@ void cps2_state::render_layers(screen_device &screen, bitmap_ind16 &bitmap, cons
 			m_bg_tilemap[i]->draw(screen, s_scroll[i], cliprect, TILEMAP_DRAW_LAYER1, 0);
 		}
 
-		s_sprites.fill(0xbff, cliprect);
-		screen.priority().fill(0, cliprect);
-		// In gfx_element::prio_transpen, a SET bit in pmask BLOCKS drawing at
-		// that destination-priority value (see PIXEL_OP_REBASE_TRANSPEN_PRIORITY
-		// in drawgfxt.ipp: draws only when ((1<<priority) & pmask) == 0). All
-		// zeros - not all ones - means "no priority level is blocked", i.e.
-		// every sprite draws regardless of the (zeroed) priority buffer. 0xff
-		// was backwards and silently discarded every sprite pixel.
-		uint32_t all_primasks[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
-		cps2_render_sprites(screen, s_sprites, cliprect, all_primasks);
+		// CPS2 ignores the sprites' slot in layer_control: the draw above takes
+		// sprites out of l0-l3 and gives EACH sprite its own priority (0-7,
+		// attribute bits 13-15) against the three tilemaps, drawn back to front
+		// as l0, l1, l2. Per the primasks setup, a priority-i sprite shows in
+		// front of tilemap k when i > lkpri, and priority 0 is never drawn
+		// (primasks[0] = 0xff). A single sprites layer can't express that, so
+		// export up to four sprite slots - behind all tilemaps, between each
+		// pair, in front of all - with slot = 1 + the front-most tilemap the
+		// sprite is in front of. (When tilemap priorities aren't in draw order,
+		// the hardware's per-pixel result has no single depth; this keeps the
+		// sprite visible in front of that tilemap.)
+		const uint8_t tilemap_pri[3] = { l0pri, l1pri, l2pri };
+		int slot_of[8];
+		for (int i = 0; i < 8; ++i) {
+			slot_of[i] = -1;
+			if (i == 0) continue;
+			slot_of[i] = 0;
+			for (int k = 0; k < 3; ++k)
+				if (i > tilemap_pri[k]) slot_of[i] = k + 1;
+		}
+
+		for (int s = 0; s < 4; ++s) {
+			s_sprite_slot[s].fill(0xbff, cliprect);
+			// In gfx_element::prio_transpen a SET bit in pmask BLOCKS drawing at
+			// that destination-priority value (PIXEL_OP_REBASE_TRANSPEN_PRIORITY
+			// in drawgfxt.ipp draws only when ((1<<priority) & pmask) == 0), so
+			// 0 lets a sprite draw regardless of the zeroed priority buffer and
+			// all ones filters it out of this slot's pass.
+			uint32_t slot_primasks[8];
+			bool any = false;
+			for (int i = 0; i < 8; ++i) {
+				bool in_slot = slot_of[i] == s;
+				slot_primasks[i] = in_slot ? 0 : ~0u;
+				any |= in_slot;
+			}
+			if (!any) continue;
+			s_slot_used[s] = true;
+			screen.priority().fill(0, cliprect);
+			cps2_render_sprites(screen, s_sprite_slot[s], cliprect, slot_primasks);
+		}
 
 		if (cliprect.max_y >= vis.max_y)
 		{
@@ -1132,19 +1159,22 @@ void cps2_state::render_layers(screen_device &screen, bitmap_ind16 &bitmap, cons
 				                       has_owners ? owners.data() : nullptr, w, h);
 			};
 
-			// CPS2 reorders layers per scene just like CPS1 (same layer-control
-			// register); export the ACTUAL draw order (retrodepth_draw_seq,
-			// captured above before it gets mutated for sprite priority
-			// masking). Layer ids: 0 = sprites, 1-3 = scroll1-3.
-			uint32_t z_of[4] = { 4, 3, 2, 1 };  // fallback if a layer id is absent
-			for (int i = 0; i < 4; ++i)
-				z_of[retrodepth_draw_seq[i]] = (uint32_t)i + 1;
-
-			write_layer(0,       "background", s_bg,        false);
-			write_layer(z_of[3], "scroll3",    s_scroll[2], true);
-			write_layer(z_of[2], "scroll2",    s_scroll[1], true);
-			write_layer(z_of[1], "scroll1",    s_scroll[0], true);
-			write_layer(z_of[0], "sprites",    s_sprites,   true);
+			// Back to front: background, sprite slot 0, tilemap l0, slot 1, l1,
+			// slot 2, l2, slot 3 - using the tilemap draw order after sprites
+			// were taken out of layer_control (l0-l2 hold tilemap ids 1-3). A
+			// tilemap missing from that sequence isn't drawn, so isn't exported.
+			static const char* const slot_names[4] = { "sprites0", "sprites1", "sprites2", "sprites3" };
+			static const char* const scroll_names[3] = { "scroll1", "scroll2", "scroll3" };
+			const uint8_t tilemap_seq[3] = { l0, l1, l2 };
+			uint32_t z = 0;
+			write_layer(z++, "background", s_bg, false);
+			for (int k = 0; k <= 3; ++k) {
+				if (s_slot_used[k])
+					write_layer(z++, slot_names[k], s_sprite_slot[k], true);
+				if (k < 3 && tilemap_seq[k] >= 1 && tilemap_seq[k] <= 3)
+					write_layer(z++, scroll_names[tilemap_seq[k] - 1], s_scroll[tilemap_seq[k] - 1], true);
+			}
+			for (bool& used : s_slot_used) used = false;
 
 			retrodepth_commit();
 			m_retrodepth_layer_exported = true;
