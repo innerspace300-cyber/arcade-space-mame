@@ -664,6 +664,7 @@ void m92_state::retrodepth_export(screen_device &screen, const rectangle &clipre
 		prio.fill(0, cliprect);
 		m_rd_sprite_pri = 2;
 		draw_sprites(screen, s_spr, cliprect);
+		prio.fill(0, cliprect); // drawn sprite pixels block later sprites
 		m_rd_sprite_pri = 0;
 		draw_sprites(screen, s_top, cliprect);
 		m_rd_sprite_pri = -1;
