@@ -43,6 +43,7 @@
 
 #include "emu.h"
 #include "m92.h"
+#include "../../emu/retrodepth.h"
 
 /*****************************************************************************/
 
@@ -389,6 +390,9 @@ void m92_state::draw_sprites(screen_device &screen, bitmap_ind16 &bitmap, const 
 
 		offs += 4 * numcols;
 
+		if (m_rd_sprite_pri >= 0 && pri != m_rd_sprite_pri)
+			continue;
+
 		x = (x - 16) & 0x1ff;
 		y = 384 - 16 - y;
 
@@ -588,5 +592,150 @@ u32 m92_state::screen_update_m92(screen_device &screen, bitmap_ind16 &bitmap, co
 	if (~m_videocontrol & 0x80)
 		draw_sprites(screen, bitmap, cliprect);
 
+	if (retrodepth_active())
+		retrodepth_export(screen, cliprect);
+
 	return 0;
+}
+
+/*****************************************************************************
+
+    RetroDepth layer export (SPATIAL EMULATOR)
+
+    Back to front:
+        0 background   pen 0 fill
+        1 pf3          playfield 3 (usually the opaque back scenery)
+        2 pf2          playfield 2
+        3 pf1          playfield 1
+        4 sprites      sprites that go under the tiles' front halves
+        5 front        the tile pixels that appear over those sprites (tile
+                       priority 1-3: a tile's top pens or the whole tile)
+        6 sprites_top  sprites flagged to appear over everything
+
+    Seen from the front this matches MAME's frame: a front-half tile pixel
+    is the only thing that hides a normal sprite, and it moves from its
+    playfield to the front layer. The screen is redrawn in strips (raster
+    IRQs change scroll mid-frame), so each strip is drawn into the layer
+    bitmaps here and the frame is exported after its last strip.
+
+*****************************************************************************/
+
+void m92_state::retrodepth_export(screen_device &screen, const rectangle &cliprect)
+{
+	static constexpr u16 TRANSP = 0xffff;
+	static bitmap_ind16 s_pf[3], s_spr, s_top;
+	static bitmap_ind8 s_tileprio;
+
+	const int bw = screen.width(), bh = screen.height();
+	if (s_spr.width() != bw || s_spr.height() != bh)
+	{
+		for (auto &b : s_pf) b.allocate(bw, bh);
+		s_spr.allocate(bw, bh);
+		s_top.allocate(bw, bh);
+		s_tileprio.allocate(bw, bh);
+	}
+
+	// Playfields, drawn as m92_draw_tiles does but each into its own bitmap;
+	// the priority bitmap collects every playfield's front halves.
+	bitmap_ind8 &prio = screen.priority();
+	prio.fill(0, cliprect);
+	for (int laynum = 2; laynum >= 0; laynum--)
+	{
+		bitmap_ind16 &dest = s_pf[laynum];
+		dest.fill(TRANSP, cliprect);
+		if (laynum == 2 && ((m_pf_master_control[2] >> 4) & 1))
+			continue;
+		M92_pf_layer_info &layer = m_pf_layer[laynum];
+		layer.wide_tmap->draw(screen, dest, cliprect, TILEMAP_DRAW_LAYER1, 0);
+		layer.tmap->draw(screen, dest, cliprect, TILEMAP_DRAW_LAYER1, 0);
+		layer.wide_tmap->draw(screen, dest, cliprect, TILEMAP_DRAW_LAYER0, 1);
+		layer.tmap->draw(screen, dest, cliprect, TILEMAP_DRAW_LAYER0, 1);
+	}
+	for (int y = cliprect.min_y; y <= cliprect.max_y; y++)
+		std::copy_n(&prio.pix(y, cliprect.min_x), cliprect.width(), &s_tileprio.pix(y, cliprect.min_x));
+
+	// Sprites, split by priority. The normal ones are drawn whole (the
+	// front layer hides what the hardware hides), so they show behind
+	// foreground tiles when the layers are spread apart.
+	s_spr.fill(TRANSP, cliprect);
+	s_top.fill(TRANSP, cliprect);
+	if (~m_videocontrol & 0x80)
+	{
+		prio.fill(0, cliprect);
+		m_rd_sprite_pri = 2;
+		draw_sprites(screen, s_spr, cliprect);
+		m_rd_sprite_pri = 0;
+		draw_sprites(screen, s_top, cliprect);
+		m_rd_sprite_pri = -1;
+	}
+
+	const rectangle &vis = screen.visible_area();
+	if (cliprect.max_y < vis.max_y)
+		return;
+
+	const rgb_t *colors = m_palette->palette()->entry_list_adjusted();
+	const int n_pens = (int)m_palette->palette()->num_colors();
+	const int w = vis.width(), h = vis.height();
+	static std::vector<uint32_t> packed;
+	static std::vector<uint16_t> owners;
+	static std::vector<uint16_t> front;
+	packed.resize(w * h);
+	owners.resize(w * h);
+	front.assign(w * h, TRANSP);
+
+	// Move each front-half pixel out of the topmost playfield showing there.
+	for (int row = 0; row < h; ++row)
+	{
+		const int y = vis.min_y + row;
+		for (int col = 0; col < w; ++col)
+		{
+			const int x = vis.min_x + col;
+			if (!(s_tileprio.pix(y, x) & 1))
+				continue;
+			for (int laynum = 0; laynum < 3; laynum++)
+			{
+				u16 &pen = s_pf[laynum].pix(y, x);
+				if (pen == TRANSP)
+					continue;
+				front[row * w + col] = pen;
+				pen = TRANSP;
+				break;
+			}
+		}
+	}
+
+	auto write_layer = [&](uint32_t z_order, const char *name, auto &&pen_at) {
+		for (int row = 0; row < h; ++row)
+		{
+			for (int col = 0; col < w; ++col)
+			{
+				const u16 pen = pen_at(row, col);
+				const int idx = row * w + col;
+				if (pen == TRANSP)
+				{
+					packed[idx] = 0x00000001u; // transparent sentinel
+					owners[idx] = RD_OWNER_NONE;
+				}
+				else
+				{
+					packed[idx] = (pen < n_pens) ? (uint32_t)colors[pen] : 0u;
+					owners[idx] = pen / 16;
+				}
+			}
+		}
+		retrodepth_write_layer(z_order, name, packed.data(), owners.data(), w, h);
+	};
+	auto from = [&](bitmap_ind16 &bmp) {
+		return [&bmp, &vis](int row, int col) { return bmp.pix(vis.min_y + row, vis.min_x + col); };
+	};
+
+	const u16 bg_pen = 0;
+	write_layer(0, "background", [&](int, int) { return bg_pen; });
+	write_layer(1, "pf3", from(s_pf[2]));
+	write_layer(2, "pf2", from(s_pf[1]));
+	write_layer(3, "pf1", from(s_pf[0]));
+	write_layer(4, "sprites", from(s_spr));
+	write_layer(5, "front", [&](int row, int col) { return front[row * w + col]; });
+	write_layer(6, "sprites_top", from(s_top));
+	retrodepth_commit();
 }

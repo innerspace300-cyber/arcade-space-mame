@@ -117,6 +117,10 @@ protected:
 	virtual void draw_sprites(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
 	void m92_update_scroll_positions();
 	void m92_draw_tiles(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect);
+	void retrodepth_export(screen_device &screen, const rectangle &cliprect);
+	// RetroDepth: draw_sprites only draws sprites of this priority (0 = over
+	// everything, 2 = under the tiles' front halves); -1 = all.
+	int m_rd_sprite_pri = -1;
 
 	void lethalth_map(address_map &map) ATTR_COLD;
 	void m92_map(address_map &map) ATTR_COLD;
