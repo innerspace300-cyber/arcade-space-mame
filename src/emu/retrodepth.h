@@ -61,6 +61,13 @@ void retrodepth_write_layer(uint32_t z_order, const char* name,
 // re-reading unchanged layers every tick.
 void retrodepth_commit();
 
+// Called by the libretro frontend with every finished frame (XRGB8888).
+// A game whose driver never exports layers (a board or screen mode without
+// a RetroDepth patch) would otherwise show nothing; this publishes its
+// whole frame as a single opaque "screen" layer instead. Once a driver has
+// committed layers for the running game, this does nothing.
+void retrodepth_frame_fallback(const uint32_t* xrgb, uint32_t width, uint32_t height, uint32_t pitch_pixels);
+
 void retrodepth_write_palette_data(const uint32_t* argb_data, uint32_t count);
 
 // Neo Geo palette-route read, called from the driver each frame (mirrors

@@ -2,6 +2,7 @@
 #include <unistd.h>
 #endif
 #include <stdint.h>
+#include "../../../emu/retrodepth.h"
 #include <string.h>
 #include <stdarg.h>
 
@@ -920,6 +921,10 @@ void retro_run(void)
 #if defined(HAVE_OPENGL) || defined(HAVE_OPENGLES)
    do_glflush();
 #else
+#ifndef M16B
+   if (draw_this_frame)
+      retrodepth_frame_fallback(videoBuffer, fb_width, fb_height, fb_width);
+#endif
    if (draw_this_frame)
       video_cb(videoBuffer, fb_width, fb_height, fb_width << LOG_PIXEL_BYTES);
    else

@@ -29,19 +29,23 @@ uint32_t    g_frame_id = 0;
 // layers since it always reads after commit.
 uint32_t    g_write_cursor = 0;
 uint32_t    g_layer_count = 0;
+// Set once the running game's driver commits layers itself.
+bool        g_driver_exports = false;
 LayerSlot   g_layers[RD_MAX_LAYERS];
 uint32_t    g_palette_argb[256 * 16]{};
 RDPaletteRoute g_route{};
 
 } // namespace
 
+// Called at every machine start, so each game starts without layers.
 void retrodepth_init()
 {
+	g_write_cursor = 0;
+	g_layer_count = 0;
+	g_driver_exports = false;
 	if (g_active) return;
 	g_active = true;
 	g_frame_id = 0;
-	g_write_cursor = 0;
-	g_layer_count = 0;
 	for (auto& r : g_route.route) r = 0xFF;
 }
 
@@ -77,9 +81,29 @@ void retrodepth_write_layer(uint32_t z_order, const char* name,
 void retrodepth_commit()
 {
 	if (!g_active) return;
+	g_driver_exports = true;
 	++g_frame_id;
 	g_layer_count = g_write_cursor; // publish this frame's count
 	g_write_cursor = 0;             // next frame's writes start from slot 0
+}
+
+void retrodepth_frame_fallback(const uint32_t* xrgb, uint32_t width, uint32_t height, uint32_t pitch_pixels)
+{
+	if (!g_active || g_driver_exports || !xrgb) return;
+	if (width == 0 || height == 0 || width > RD_MAX_WIDTH || height > RD_MAX_HEIGHT) return;
+	LayerSlot& s = g_layers[0];
+	std::memset(s.desc.name, 0, sizeof(s.desc.name));
+	std::strncpy(s.desc.name, "screen", sizeof(s.desc.name) - 1);
+	s.desc.z_order   = 0;
+	s.desc.width     = width;
+	s.desc.height    = height;
+	s.desc.has_owner = false;
+	for (uint32_t y = 0; y < height; ++y)
+		for (uint32_t x = 0; x < width; ++x)
+			s.pixels[y * width + x] = xrgb[y * pitch_pixels + x] | 0xff000000u;
+	++g_frame_id;
+	g_layer_count = 1;
+	g_write_cursor = 0;
 }
 
 void retrodepth_write_palette_data(const uint32_t* argb_data, uint32_t count)
