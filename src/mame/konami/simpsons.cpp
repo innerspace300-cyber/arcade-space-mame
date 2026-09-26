@@ -119,6 +119,8 @@ Notes:
 
 #include <algorithm>
 
+#include "konami_retrodepth.h"
+
 
 namespace {
 
@@ -163,6 +165,7 @@ private:
 	int32_t    m_sprite_colorbase = 0;
 	int32_t    m_layer_colorbase[3]{};
 	int32_t    m_layerpri[3]{};
+	int        m_rd_sprite_slot = -1; // RetroDepth: see konami_retrodepth.h
 	emu_timer *m_dma_start_timer;
 	emu_timer *m_dma_end_timer;
 
@@ -232,6 +235,7 @@ K053246_CB_MEMBER(simpsons_state::sprite_callback)
 		priority_mask = 0xf0 | 0xcc;
 	else
 		priority_mask = 0xf0 | 0xcc | 0xaa;
+	konami_rd_filter_sprite(m_rd_sprite_slot, priority_mask);
 
 	color = m_sprite_colorbase + (color & 0x001f);
 }
@@ -323,6 +327,17 @@ uint32_t simpsons_state::screen_update(screen_device &screen, bitmap_ind16 &bitm
 	m_k052109->tilemap_draw(screen, bitmap, cliprect, layer[2], 0, 4);
 
 	m_k053246->k053247_sprites_draw(bitmap, cliprect);
+
+	// RetroDepth layer export (SPATIAL EMULATOR): see konami_retrodepth.h.
+	if (retrodepth_active())
+		konami_rd_export(screen, cliprect, m_k052109->palette(), 16 * bg_colorbase,
+				[&](int i, bitmap_ind16 &dest) { m_k052109->tilemap_draw(screen, dest, cliprect, layer[i], 0, 0); },
+				[&](int slot, bitmap_ind16 &dest)
+				{
+					m_rd_sprite_slot = slot;
+					m_k053246->k053247_sprites_draw(dest, cliprect);
+					m_rd_sprite_slot = -1;
+				});
 	return 0;
 }
 
