@@ -1151,3 +1151,25 @@ void retro_frame_draw_enable(bool enable)
 {
    draw_this_frame = enable;
 }
+
+/*
+ * SPATIAL EMULATOR: read a CPU's memory from the app, between frames
+ * (retro_run). Read-only: the app checks a game's "players in the game"
+ * flags (PlayerSlots) to tell whether the player it's switching away from is
+ * still playing. tag is the CPU's device tag, e.g. "maincpu"; addresses are
+ * that CPU's program space. Returns false if no game is running or the CPU
+ * doesn't exist.
+ */
+extern "C" RETRO_API bool spatial_mem_read(const char *tag, uint32_t address, uint8_t *out, uint32_t length)
+{
+   if (!tag || !out || !mame_machine_manager::instance() || !mame_machine_manager::instance()->machine())
+      return false;
+   device_t *device = mame_machine_manager::instance()->machine()->root_device().subdevice(tag);
+   device_memory_interface *memory;
+   if (!device || !device->interface(memory) || !memory->has_space(AS_PROGRAM))
+      return false;
+   address_space &space = memory->space(AS_PROGRAM);
+   for (uint32_t i = 0; i < length; i++)
+      out[i] = space.read_byte(address + i);
+   return true;
+}
