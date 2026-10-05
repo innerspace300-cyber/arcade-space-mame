@@ -730,6 +730,25 @@ int drcbe_c::execute(code_handle &entry)
 {
 	// save environment
 	int const feround = std::fegetround();
+	// The guest's rounding mode is put on the host's FPU only when a float
+	// operation runs, and the host's put back around memory accesses and C
+	// calls only if it was changed: writing the mode stalls the processor,
+	// and doing it around every access was most of the time spent running
+	// CPUs that never use floating point (CV1000's SH-3). On ARM64 the
+	// <cfenv> modes are the FPCR's RMode bits, so it's one register write.
+	int round = feround;    // the mode on the FPU
+	int want = feround;     // the guest's (applied before float operations)
+	auto const setround = [&round] (int mode)
+	{
+		if (mode == round) return;
+		round = mode;
+#if defined(__aarch64__) && defined(__clang__)
+		uint64_t fpcr = __builtin_arm_rsr64("fpcr");
+		__builtin_arm_wsr64("fpcr", (fpcr & ~uint64_t(0xc00000)) | uint64_t(mode));
+#else
+		std::fesetround(mode);
+#endif
+	};
 
 	// get the entry point
 	const drcbec_instruction *inst = (const drcbec_instruction *)entry.codeptr();
@@ -748,6 +767,12 @@ int drcbe_c::execute(code_handle &entry)
 		while (true)
 		{
 			uint32_t opcode = (inst++)->i;
+			if (want != round)
+			{
+				uint32_t const op = OPCODE_GET_SHORT(opcode) >> 2;
+				if (op >= OP_FLOAD && op <= OP_ICOPYF)
+					setround(want);
+			}
 
 			switch (OPCODE_GET_SHORT(opcode))
 			{
@@ -768,9 +793,9 @@ int drcbe_c::execute(code_handle &entry)
 			case MAKE_OPCODE_SHORT(OP_DEBUG, 4, 0):     // DEBUG   pc
 				if (m_device.machine().debug_flags & DEBUG_FLAG_CALL_HOOK)
 				{
-					std::fesetround(feround);
+					setround(feround);
 					m_device.debug()->instruction_hook(PARAM0);
-					std::fesetround(rounding_map[m_state.fmod & 0x03]);
+					want = rounding_map[m_state.fmod & 0x03];
 				}
 				break;
 
@@ -794,7 +819,7 @@ int drcbe_c::execute(code_handle &entry)
 				[[fallthrough]];
 
 			case MAKE_OPCODE_SHORT(OP_EXIT, 4, 0):
-				std::fesetround(feround);
+				setround(feround);
 				return PARAM0;
 
 			case MAKE_OPCODE_SHORT(OP_JMP, 4, 1):       // JMP     imm[,c]
@@ -853,9 +878,9 @@ int drcbe_c::execute(code_handle &entry)
 				[[fallthrough]];
 
 			case MAKE_OPCODE_SHORT(OP_CALLC, 4, 0):
-				std::fesetround(feround);
+				setround(feround);
 				(*inst[0].cfunc)(inst[1].v);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_RECOVER, 4, 0):   // RECOVER dst,mapvar
@@ -868,7 +893,7 @@ int drcbe_c::execute(code_handle &entry)
 
 			case MAKE_OPCODE_SHORT(OP_SETFMOD, 4, 0):   // SETFMOD src
 				m_state.fmod = PARAM0 & 0x03;
-				std::fesetround(rounding_map[PARAM0 & 0x03]);
+				want = rounding_map[PARAM0 & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_GETFMOD, 4, 0):   // GETFMOD dst
@@ -897,7 +922,7 @@ int drcbe_c::execute(code_handle &entry)
 			case MAKE_OPCODE_SHORT(OP_RESTORE, 4, 1):   // RESTORE dst
 				m_state = *inst[0].state;
 				flags = m_state.flags &= FLAGS_ALL;
-				std::fesetround(rounding_map[m_state.fmod &= 0x03]);
+				want = rounding_map[m_state.fmod &= 0x03];
 				break;
 
 
@@ -1048,75 +1073,75 @@ int drcbe_c::execute(code_handle &entry)
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READ1, 4, 0):     // READ    dst,src1,space_BYTE
-				std::fesetround(feround);
+				setround(feround);
 				PARAM0 = SPACEPARAM2.read_byte(PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READ2, 4, 0):     // READ    dst,src1,space_WORD
-				std::fesetround(feround);
+				setround(feround);
 				PARAM0 = SPACEPARAM2.read_word(PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READ4, 4, 0):     // READ    dst,src1,space_DWORD
-				std::fesetround(feround);
+				setround(feround);
 				PARAM0 = SPACEPARAM2.read_dword(PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READM1, 4, 0):    // READM   dst,src1,mask,space_BYTE
-				std::fesetround(feround);
+				setround(feround);
 				PARAM0 = SPACEPARAM3.read_byte(PARAM1, PARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READM2, 4, 0):    // READM   dst,src1,mask,space_WORD
-				std::fesetround(feround);
+				setround(feround);
 				PARAM0 = SPACEPARAM3.read_word(PARAM1, PARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READM4, 4, 0):    // READM   dst,src1,mask,space_DWORD
-				std::fesetround(feround);
+				setround(feround);
 				PARAM0 = SPACEPARAM3.read_dword(PARAM1, PARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITE1, 4, 0):    // WRITE   dst,src1,space_BYTE
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM2.write_byte(PARAM0, PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITE2, 4, 0):    // WRITE   dst,src1,space_WORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM2.write_word(PARAM0, PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITE4, 4, 0):    // WRITE   dst,src1,space_DWORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM2.write_dword(PARAM0, PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITEM1, 4, 0):   // WRITEM  dst,src1,mask,space_BYTE
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM3.write_byte(PARAM0, PARAM1, PARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITEM2, 4, 0):   // WRITEM  dst,src1,mask,space_WORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM3.write_word(PARAM0, PARAM1, PARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITEM4, 4, 0):   // WRITEM  dst,src1,mask,space_DWORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM3.write_dword(PARAM0, PARAM1, PARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_CARRY, 4, 0):     // CARRY   src,bitnum
@@ -1716,99 +1741,99 @@ int drcbe_c::execute(code_handle &entry)
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READ1, 8, 0):     // DREAD   dst,src1,space_BYTE
-				std::fesetround(feround);
+				setround(feround);
 				DPARAM0 = SPACEPARAM2.read_byte(PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READ2, 8, 0):     // DREAD   dst,src1,space_WORD
-				std::fesetround(feround);
+				setround(feround);
 				DPARAM0 = SPACEPARAM2.read_word(PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READ4, 8, 0):     // DREAD   dst,src1,space_DWORD
-				std::fesetround(feround);
+				setround(feround);
 				DPARAM0 = SPACEPARAM2.read_dword(PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READ8, 8, 0):     // DREAD   dst,src1,space_QWORD
-				std::fesetround(feround);
+				setround(feround);
 				DPARAM0 = SPACEPARAM2.read_qword(PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READM1, 8, 0):    // DREADM  dst,src1,mask,space_BYTE
-				std::fesetround(feround);
+				setround(feround);
 				DPARAM0 = SPACEPARAM3.read_byte(PARAM1, DPARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READM2, 8, 0):    // DREADM  dst,src1,mask,space_WORD
-				std::fesetround(feround);
+				setround(feround);
 				DPARAM0 = SPACEPARAM3.read_word(PARAM1, DPARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READM4, 8, 0):    // DREADM  dst,src1,mask,space_DWORD
-				std::fesetround(feround);
+				setround(feround);
 				DPARAM0 = SPACEPARAM3.read_dword(PARAM1, DPARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_READM8, 8, 0):    // DREADM  dst,src1,mask,space_QWORD
-				std::fesetround(feround);
+				setround(feround);
 				DPARAM0 = SPACEPARAM3.read_qword(PARAM1, DPARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITE1, 8, 0):    // DWRITE  dst,src1,space_BYTE
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM2.write_byte(PARAM0, PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITE2, 8, 0):    // DWRITE  dst,src1,space_WORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM2.write_word(PARAM0, PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITE4, 8, 0):    // DWRITE  dst,src1,space_DWORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM2.write_dword(PARAM0, PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITE8, 8, 0):    // DWRITE  dst,src1,space_QWORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM2.write_qword(PARAM0, DPARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITEM1, 8, 0):   // DWRITEM dst,src1,mask,space_BYTE
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM3.write_byte(PARAM0, DPARAM1, DPARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITEM2, 8, 0):   // DWRITEM dst,src1,mask,space_WORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM3.write_word(PARAM0, DPARAM1, DPARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITEM4, 8, 0):   // DWRITEM dst,src1,mask,space_DWORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM3.write_dword(PARAM0, DPARAM1, DPARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_WRITEM8, 8, 0):   // DWRITEM dst,src1,mask,space_QWORD
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM3.write_qword(PARAM0, DPARAM1, DPARAM2);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_CARRY, 8, 0):     // DCARRY  src,bitnum
@@ -2210,15 +2235,15 @@ int drcbe_c::execute(code_handle &entry)
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_FREAD, 4, 0):     // FSREAD  dst,src1,space
-				std::fesetround(feround);
+				setround(feround);
 				PARAM0 = SPACEPARAM2.read_dword(PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_FWRITE, 4, 0):    // FSWRITE dst,src1,space
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM2.write_dword(PARAM0, PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_FMOV, 4, 1):      // FSMOV   dst,src[,c]
@@ -2345,15 +2370,15 @@ int drcbe_c::execute(code_handle &entry)
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_FREAD, 8, 0):     // FDREAD  dst,src1,space
-				std::fesetround(feround);
+				setround(feround);
 				DPARAM0 = SPACEPARAM2.read_qword(PARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_FWRITE, 8, 0):    // FDWRITE dst,src1,space
-				std::fesetround(feround);
+				setround(feround);
 				SPACEPARAM2.write_qword(PARAM0, DPARAM1);
-				std::fesetround(rounding_map[m_state.fmod & 0x03]);
+				want = rounding_map[m_state.fmod & 0x03];
 				break;
 
 			case MAKE_OPCODE_SHORT(OP_FMOV, 8, 1):      // FDMOV   dst,src[,c]
@@ -2482,7 +2507,7 @@ int drcbe_c::execute(code_handle &entry)
 	}
 	catch (...)
 	{
-		std::fesetround(feround);
+		setround(feround);
 		throw;
 	}
 

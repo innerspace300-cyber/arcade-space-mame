@@ -199,7 +199,7 @@ Removed games
 #include "cv1k_v.h"
 
 #include "cpu/sh/sh3comn.h"
-#include "cpu/sh/sh7709s.h"
+#include "cpu/sh/sh4.h"
 #include "machine/nandflash.h"
 #include "machine/rtc9701.h"
 #include "sound/ymz770.h"
@@ -240,7 +240,7 @@ protected:
 	virtual void machine_reset() override ATTR_COLD;
 
 private:
-	required_device<sh7709s_device> m_maincpu;
+	required_device<sh3_device> m_maincpu;
 	required_device<cv1k_blitter_device> m_blitter;
 	required_device<samsung_k9f1g08u0m_device> m_nand;
 	required_device<rtc9701_device> m_eeprom;
@@ -540,7 +540,10 @@ void cv1k_state::machine_reset()
 void cv1k_state::cv1k(machine_config &config)
 {
 	/* basic machine hardware */
-	SH7709S(config, m_maincpu, 12.8_MHz_XTAL*8, ENDIANNESS_BIG); // 102.4MHz
+	// ARcade: the plain SH-3, not the SH7709S with its cache/memory timing.
+	// That timing gives the boards' real slowdown but takes half the time
+	// on an iPhone, where the recompiler can't make native code (drcbe_c).
+	SH3(config, m_maincpu, 12.8_MHz_XTAL*8, ENDIANNESS_BIG); // 102.4MHz
 	m_maincpu->set_md(0, 0); // none of this is verified
 	m_maincpu->set_md(1, 0); // (the sh3 is different to the sh4 anyway, should be changed)
 	m_maincpu->set_md(2, 0);
