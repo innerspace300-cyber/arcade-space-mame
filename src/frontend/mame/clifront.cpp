@@ -57,6 +57,7 @@ void free_man()
 {
 	util::archive_file::cache_clear();
 	delete retro_manager;
+	retro_manager = nullptr;
 }
 #endif
 

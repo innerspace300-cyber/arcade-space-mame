@@ -73,6 +73,20 @@ void free_machineconfig()
 
 	delete retro_global_machine;
 	delete retro_global_config;
+	retro_global_machine = nullptr;
+	retro_global_config = nullptr;
+}
+
+// A load that failed (missing or bad ROMs): what retro_finish does, less the
+// exit of a machine that never ran. Left behind, the next load gets this
+// manager, still pointing at the failed run's options and OSD, and crashes.
+void retro_load_failed()
+{
+	if (!retro_manager)
+		return;
+
+	free_machineconfig();
+	free_man();
 }
 
 void retro_finish()

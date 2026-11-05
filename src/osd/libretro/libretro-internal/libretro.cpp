@@ -24,6 +24,7 @@
 /* forward decls / externs / prototypes */
 
 extern void retro_finish();
+extern void retro_load_failed();
 extern void retro_main_loop();
 
 int POSTNOTIFY     = 5; /* See retro_loop() */
@@ -983,6 +984,7 @@ bool retro_load_game(const struct retro_game_info *info)
       log_cb(RETRO_LOG_DEBUG, "%s osd_sleep\n", __func__);
       osd_sleep(osd_ticks_per_second());
       log_cb(RETRO_LOG_DEBUG, "%s osd_sleep done\n", __func__);
+      retro_load_failed();
       return false;
    }
 
